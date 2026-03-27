@@ -128,7 +128,7 @@ def _iter_task_examples(root: Path, task: str, prompt_domain: str) -> Iterable[T
 def _iter_pararel_examples(path: Path) -> Iterable[TaskExample]:
     data = _load_json(path)
     for index, sample in enumerate(data):
-        question, answer = sample
+        question, answer, *_ = sample
         prompt = (
             f"Question: {question}\n"
             "Answer with a short entity or phrase only."
