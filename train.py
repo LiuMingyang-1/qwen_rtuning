@@ -269,7 +269,6 @@ def build_training_arguments(args: argparse.Namespace) -> TrainingArguments:
         remove_unused_columns=False,
         gradient_checkpointing=args.gradient_checkpointing,
         ddp_find_unused_parameters=False,
-        save_safetensors=True,
         optim="adamw_torch",
         logging_strategy="steps",
         save_strategy="steps",
