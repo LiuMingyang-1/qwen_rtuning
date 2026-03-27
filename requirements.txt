@@ -1,0 +1,7 @@
+torch>=2.1
+transformers>=4.44
+peft>=0.12
+accelerate>=0.34
+bitsandbytes>=0.43
+tqdm>=4.66
+
