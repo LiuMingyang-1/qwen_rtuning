@@ -164,13 +164,11 @@ def candidate_logprob(model: Any, tokenizer: Any, prompt: str, candidate: str) -
 
     input_ids = torch.cat([prompt_ids["input_ids"], candidate_ids["input_ids"]], dim=1)
     attention_mask = torch.ones_like(input_ids)
-    prompt_len = prompt_ids["input_ids"].shape[1]
     with torch.inference_mode():
-        # Only compute lm_head on the positions we need (candidate tokens)
-        # to avoid a huge [seq_len, vocab_size] allocation that OOMs on long prompts.
-        hidden_states = model.model(input_ids=input_ids, attention_mask=attention_mask)[0]
-        candidate_logits = model.lm_head(hidden_states[:, prompt_len - 1 : -1, :])
+        logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
 
+    prompt_len = prompt_ids["input_ids"].shape[1]
+    candidate_logits = logits[:, prompt_len - 1 : -1, :]
     candidate_token_ids = candidate_ids["input_ids"]
     token_log_probs = torch.log_softmax(candidate_logits, dim=-1)
     gathered = token_log_probs.gather(dim=-1, index=candidate_token_ids.unsqueeze(-1)).squeeze(-1)
