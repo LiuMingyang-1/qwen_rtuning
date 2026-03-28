@@ -9,6 +9,8 @@ OUTPUT_ROOT=${OUTPUT_ROOT:-../outputs}
 DATA_PATH="${OUTPUT_ROOT}/data/${METHOD}.jsonl"
 CKPT_PATH="${OUTPUT_ROOT}/checkpoints/qwen2.5-rtuning-${METHOD}"
 
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 echo "=== Step 1: Build dataset (method=${METHOD}) ==="
 python3 build_dataset.py \
   --model_name_or_path "${MODEL}" \
@@ -19,7 +21,6 @@ python3 build_dataset.py \
   --load_in_4bit
 
 echo "=== Step 2: Train ==="
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 python3 train.py \
   --model_name_or_path "${MODEL}" \
   --dataset_path "${DATA_PATH}" \
