@@ -3,6 +3,8 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+.DS_Store
+*.zip
 outputs/
 *.jsonl
 *.jsonl.summary.json

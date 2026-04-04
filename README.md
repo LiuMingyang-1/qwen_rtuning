@@ -193,6 +193,57 @@ torchrun --nproc_per_node=4 qwen_rtuning/train.py \
 
 如果你后面想合并权重，可以再单独写 merge 脚本，或者直接在推理时加载 adapter。
 
+## 评测
+
+仓库现在提供独立的 `eval.py`，用于加载基座模型或 `基座 + LoRA adapter`，并在测试集上做离线评测。
+
+默认输出：
+
+- `predictions.jsonl`：逐样本预测结果
+- `metrics.json`：整体和分任务指标
+
+### 评测训练后的 LoRA adapter
+
+```bash
+python3 qwen_rtuning/eval.py \
+  --model_name_or_path Qwen/Qwen2.5-7B-Instruct \
+  --adapter_path outputs/checkpoints/qwen2.5-rtuning-unsure \
+  --data_root qwen_rtuning/R-Tuning-data \
+  --tasks pararel mmlu fever hotpotqa wice \
+  --prompt_domain ID \
+  --output_dir outputs/eval/qwen2.5-rtuning-unsure-id \
+  --load_in_4bit \
+  --bf16
+```
+
+### 只评测基座模型
+
+```bash
+python3 qwen_rtuning/eval.py \
+  --model_name_or_path Qwen/Qwen2.5-7B-Instruct \
+  --data_root qwen_rtuning/R-Tuning-data \
+  --tasks pararel mmlu fever hotpotqa wice \
+  --prompt_domain ID \
+  --output_dir outputs/eval/qwen2.5-base-id \
+  --load_in_4bit \
+  --bf16
+```
+
+### 小样本 smoke test
+
+```bash
+python3 qwen_rtuning/eval.py \
+  --model_name_or_path Qwen/Qwen2.5-7B-Instruct \
+  --adapter_path outputs/checkpoints/qwen2.5-rtuning-unsure \
+  --data_root qwen_rtuning/R-Tuning-data \
+  --tasks mmlu fever \
+  --prompt_domain ID \
+  --limit_per_task 5 \
+  --output_dir outputs/eval/smoke \
+  --load_in_4bit \
+  --bf16
+```
+
 ## 建议的实际执行顺序
 
 上服务器以后先别直接全量跑，建议按这个顺序：

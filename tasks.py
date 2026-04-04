@@ -33,12 +33,19 @@ SUPPORTED_TASKS = ["pararel", "mmlu", "fever", "hotpotqa", "wice"]
 
 DEFAULT_TASK_FILES = {
     "pararel": Path("pararel/training_data.json"),
+    "pararel_test_id": Path("pararel/ID_test_pararel.json"),
+    "pararel_test_ood": Path("pararel/OOD_test_pararel.json"),
     "mmlu_train": Path("MMLU/MMLU_ID_train.json"),
+    "mmlu_test_id": Path("MMLU/MMLU_ID_test.json"),
+    "mmlu_test_ood": Path("MMLU/MMLU_OOD_test.json"),
     "mmlu_prompt_id": Path("MMLU/MMLU_ID_prompt.json"),
     "mmlu_prompt_ood": Path("MMLU/MMLU_OOD_prompt.json"),
     "fever": Path("FEVER/fever_10k.json"),
+    "fever_test": Path("FEVER/fever_10k_test.json"),
     "hotpotqa": Path("HotpotQA/hotpot_10k.json"),
+    "hotpotqa_test": Path("HotpotQA/hotpot_test.json"),
     "wice": Path("WiCE/wice_train.json"),
+    "wice_test": Path("WiCE/wice_test.json"),
 }
 
 
@@ -66,15 +73,26 @@ def load_task_examples(
     tasks: Iterable[str],
     prompt_domain: str = "ID",
     limit_per_task: int | None = None,
+    split: str = "train",
 ) -> list[TaskExample]:
     root = Path(data_root)
     if not root.exists():
         raise FileNotFoundError(f"Data root does not exist: {root}")
+    normalized_split = split.strip().lower()
+    if normalized_split not in {"train", "test"}:
+        raise ValueError(f"Unsupported split '{split}'. Expected 'train' or 'test'.")
 
     examples: list[TaskExample] = []
     for task in tasks:
         normalized = normalize_task_name(task)
-        task_examples = list(_iter_task_examples(root, normalized, prompt_domain=prompt_domain))
+        task_examples = list(
+            _iter_task_examples(
+                root,
+                normalized,
+                prompt_domain=prompt_domain,
+                split=normalized_split,
+            )
+        )
         if limit_per_task is not None:
             task_examples = task_examples[:limit_per_task]
         examples.extend(task_examples)
@@ -100,32 +118,57 @@ def _load_json(path: Path) -> Any:
     if not path.exists():
         raise FileNotFoundError(f"Expected dataset file was not found: {path}")
     with path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
+        raw_text = handle.read()
+    try:
+        return json.loads(raw_text)
+    except json.JSONDecodeError:
+        lines = [line for line in raw_text.splitlines() if line.strip()]
+        if not lines:
+            raise
+        return [json.loads(line) for line in lines]
 
 
-def _iter_task_examples(root: Path, task: str, prompt_domain: str) -> Iterable[TaskExample]:
+def _iter_task_examples(root: Path, task: str, prompt_domain: str, split: str) -> Iterable[TaskExample]:
+    prompt_domain = prompt_domain.upper()
     if task == "pararel":
-        yield from _iter_pararel_examples(root / DEFAULT_TASK_FILES["pararel"])
+        if split == "train":
+            path = root / DEFAULT_TASK_FILES["pararel"]
+            sample_id_prefix = "pararel-train"
+        else:
+            file_key = "pararel_test_id" if prompt_domain == "ID" else "pararel_test_ood"
+            path = root / DEFAULT_TASK_FILES[file_key]
+            sample_id_prefix = f"pararel-test-{prompt_domain.lower()}"
+        yield from _iter_pararel_examples(path, sample_id_prefix=sample_id_prefix)
         return
     if task == "mmlu":
-        train_path = root / DEFAULT_TASK_FILES["mmlu_train"]
-        prompt_key = "mmlu_prompt_id" if prompt_domain.upper() == "ID" else "mmlu_prompt_ood"
+        data_key = "mmlu_train" if split == "train" else (
+            "mmlu_test_id" if prompt_domain == "ID" else "mmlu_test_ood"
+        )
+        data_path = root / DEFAULT_TASK_FILES[data_key]
+        prompt_key = "mmlu_prompt_id" if prompt_domain == "ID" else "mmlu_prompt_ood"
         prompt_path = root / DEFAULT_TASK_FILES[prompt_key]
-        yield from _iter_mmlu_examples(train_path, prompt_path)
+        sample_id_prefix = "mmlu-train" if split == "train" else f"mmlu-test-{prompt_domain.lower()}"
+        yield from _iter_mmlu_examples(data_path, prompt_path, sample_id_prefix=sample_id_prefix)
         return
     if task == "fever":
-        yield from _iter_fever_examples(root / DEFAULT_TASK_FILES["fever"])
+        file_key = "fever" if split == "train" else "fever_test"
+        sample_id_prefix = f"fever-{split}"
+        yield from _iter_fever_examples(root / DEFAULT_TASK_FILES[file_key], sample_id_prefix=sample_id_prefix)
         return
     if task == "hotpotqa":
-        yield from _iter_hotpot_examples(root / DEFAULT_TASK_FILES["hotpotqa"])
+        file_key = "hotpotqa" if split == "train" else "hotpotqa_test"
+        sample_id_prefix = f"hotpotqa-{split}"
+        yield from _iter_hotpot_examples(root / DEFAULT_TASK_FILES[file_key], sample_id_prefix=sample_id_prefix)
         return
     if task == "wice":
-        yield from _iter_wice_examples(root / DEFAULT_TASK_FILES["wice"])
+        file_key = "wice" if split == "train" else "wice_test"
+        sample_id_prefix = f"wice-{split}"
+        yield from _iter_wice_examples(root / DEFAULT_TASK_FILES[file_key], sample_id_prefix=sample_id_prefix)
         return
     raise ValueError(f"Unexpected task: {task}")
 
 
-def _iter_pararel_examples(path: Path) -> Iterable[TaskExample]:
+def _iter_pararel_examples(path: Path, sample_id_prefix: str = "pararel") -> Iterable[TaskExample]:
     data = _load_json(path)
     for index, sample in enumerate(data):
         question, answer, *_ = sample
@@ -135,7 +178,7 @@ def _iter_pararel_examples(path: Path) -> Iterable[TaskExample]:
         )
         yield TaskExample(
             task="pararel",
-            sample_id=f"pararel-{index}",
+            sample_id=f"{sample_id_prefix}-{index}",
             prompt=prompt,
             gold_answer=str(answer).strip(),
             answer_kind="open",
@@ -171,8 +214,8 @@ def _format_mmlu_shots(prompt_data: list[list[str]]) -> str:
     return "\n\n".join(formatted)
 
 
-def _iter_mmlu_examples(train_path: Path, prompt_path: Path) -> Iterable[TaskExample]:
-    train_data = _load_json(train_path)
+def _iter_mmlu_examples(data_path: Path, prompt_path: Path, sample_id_prefix: str = "mmlu") -> Iterable[TaskExample]:
+    train_data = _load_json(data_path)
     prompt_data = _load_json(prompt_path)
     for subject, samples in train_data.items():
         subject_prompt = (
@@ -184,7 +227,7 @@ def _iter_mmlu_examples(train_path: Path, prompt_path: Path) -> Iterable[TaskExa
             prompt = subject_prompt + formatted_shots + "\n\n" + _format_mmlu_example(sample)
             yield TaskExample(
                 task="mmlu",
-                sample_id=f"mmlu-{subject}-{index}",
+                sample_id=f"{sample_id_prefix}-{subject}-{index}",
                 prompt=prompt,
                 gold_answer=str(sample[5]).strip(),
                 answer_kind="classification",
@@ -194,7 +237,7 @@ def _iter_mmlu_examples(train_path: Path, prompt_path: Path) -> Iterable[TaskExa
             )
 
 
-def _iter_fever_examples(path: Path) -> Iterable[TaskExample]:
+def _iter_fever_examples(path: Path, sample_id_prefix: str = "fever") -> Iterable[TaskExample]:
     mapping = {"SUPPORTS": "A", "REFUTES": "B", "NOT ENOUGH INFO": "C"}
     candidate_answer = ["SUPPORTS.", "REFUTES.", "NOT ENOUGH INFO."]
     data = _load_json(path)
@@ -211,7 +254,7 @@ def _iter_fever_examples(path: Path) -> Iterable[TaskExample]:
         )
         yield TaskExample(
             task="fever",
-            sample_id=f"fever-{index}",
+            sample_id=f"{sample_id_prefix}-{index}",
             prompt=prompt,
             gold_answer=mapping[sample["label"]],
             answer_kind="classification",
@@ -221,7 +264,7 @@ def _iter_fever_examples(path: Path) -> Iterable[TaskExample]:
         )
 
 
-def _iter_hotpot_examples(path: Path) -> Iterable[TaskExample]:
+def _iter_hotpot_examples(path: Path, sample_id_prefix: str = "hotpotqa") -> Iterable[TaskExample]:
     data = _load_json(path)
     for index, sample in enumerate(data):
         context_blocks = []
@@ -235,7 +278,7 @@ def _iter_hotpot_examples(path: Path) -> Iterable[TaskExample]:
         )
         yield TaskExample(
             task="hotpotqa",
-            sample_id=f"hotpotqa-{index}",
+            sample_id=f"{sample_id_prefix}-{index}",
             prompt=prompt,
             gold_answer=str(sample["answer"]).strip(),
             answer_kind="open",
@@ -244,7 +287,7 @@ def _iter_hotpot_examples(path: Path) -> Iterable[TaskExample]:
         )
 
 
-def _iter_wice_examples(path: Path) -> Iterable[TaskExample]:
+def _iter_wice_examples(path: Path, sample_id_prefix: str = "wice") -> Iterable[TaskExample]:
     mapping = {"supported": "A", "partially_supported": "B", "not_supported": "C"}
     candidate_answer = ["supported.", "partially_supported.", "not_supported."]
     data = _load_json(path)
@@ -261,7 +304,7 @@ def _iter_wice_examples(path: Path) -> Iterable[TaskExample]:
         )
         yield TaskExample(
             task="wice",
-            sample_id=f"wice-{index}",
+            sample_id=f"{sample_id_prefix}-{index}",
             prompt=prompt,
             gold_answer=mapping[sample["label"]],
             answer_kind="classification",
@@ -269,4 +312,3 @@ def _iter_wice_examples(path: Path) -> Iterable[TaskExample]:
             max_new_tokens=4,
             metadata={"label": sample["label"]},
         )
-
