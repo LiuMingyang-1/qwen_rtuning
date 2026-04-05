@@ -16,7 +16,7 @@ from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, set_seed
 
 from qwen_rtuning.chat_utils import render_chat_text
-from qwen_rtuning.tasks import SUPPORTED_TASKS, TaskExample, is_open_answer_correct, load_task_examples
+from qwen_rtuning.tasks import FOLLOW_UP_QUESTION, SUPPORTED_TASKS, TaskExample, is_open_answer_correct, load_task_examples
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,6 +39,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional attention backend, for example flash_attention_2 or sdpa.",
     )
+    parser.add_argument("--batch_size", type=int, default=1)
     return parser.parse_args()
 
 
@@ -120,18 +121,18 @@ def build_prompt_messages(prompt: str) -> list[dict[str, str]]:
     return [{"role": "user", "content": prompt}]
 
 
-def generate_answer(
+def batch_generate(
     model: Any,
     tokenizer: Any,
-    prompt: str,
+    rendered_prompts: list[str],
     max_new_tokens: int,
-) -> str:
-    rendered = render_chat_text(
-        tokenizer,
-        build_prompt_messages(prompt),
-        add_generation_prompt=True,
-    )
-    inputs = tokenizer(rendered, return_tensors="pt").to(get_model_device(model))
+) -> list[str]:
+    inputs = tokenizer(
+        rendered_prompts,
+        return_tensors="pt",
+        padding=True,
+        truncation=False,
+    ).to(get_model_device(model))
     with torch.inference_mode():
         outputs = model.generate(
             **inputs,
@@ -140,87 +141,141 @@ def generate_answer(
             eos_token_id=tokenizer.eos_token_id,
             do_sample=False,
         )
-    generated_ids = outputs[0][inputs["input_ids"].shape[1]:]
-    return postprocess_generation(tokenizer.decode(generated_ids, skip_special_tokens=True))
+    prompt_len = inputs["input_ids"].shape[1]
+    return [
+        postprocess_generation(tokenizer.decode(output[prompt_len:], skip_special_tokens=True))
+        for output in outputs
+    ]
 
 
-def candidate_logprob(model: Any, tokenizer: Any, prompt: str, candidate: str) -> float:
-    rendered = render_chat_text(
-        tokenizer,
-        build_prompt_messages(prompt),
-        add_generation_prompt=True,
-    )
-    prompt_ids = tokenizer(rendered, add_special_tokens=False, return_tensors="pt").to(get_model_device(model))
-    candidate_ids = tokenizer(candidate, add_special_tokens=False, return_tensors="pt").to(get_model_device(model))
+def is_refusal(followup_response: str) -> bool:
+    return "i am unsure" in followup_response.lower()
 
-    input_ids = torch.cat([prompt_ids["input_ids"], candidate_ids["input_ids"]], dim=1)
-    attention_mask = torch.ones_like(input_ids)
+
+def batch_candidate_logprob(
+    model: Any,
+    tokenizer: Any,
+    rendered_prompts: list[str],
+    candidates: list[str],
+) -> list[float]:
+    """Compute log-prob of each candidate given the corresponding prompt, in a single batched forward pass."""
+    device = get_model_device(model)
+    prompt_id_list = [
+        tokenizer(p, add_special_tokens=False, return_tensors="pt")["input_ids"][0]
+        for p in rendered_prompts
+    ]
+    candidate_id_list = [
+        tokenizer(c, add_special_tokens=False, return_tensors="pt")["input_ids"][0]
+        for c in candidates
+    ]
+    combined = [torch.cat([p, c]) for p, c in zip(prompt_id_list, candidate_id_list)]
+    max_len = max(t.shape[0] for t in combined)
+
+    padded_input_ids = []
+    attention_masks = []
+    for seq in combined:
+        pad_len = max_len - seq.shape[0]
+        padded_input_ids.append(torch.cat([torch.full((pad_len,), tokenizer.pad_token_id, dtype=torch.long), seq]))
+        attention_masks.append(torch.cat([torch.zeros(pad_len, dtype=torch.long), torch.ones(seq.shape[0], dtype=torch.long)]))
+
+    input_ids = torch.stack(padded_input_ids).to(device)
+    attention_mask = torch.stack(attention_masks).to(device)
+
     with torch.inference_mode():
         logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
 
-    prompt_len = prompt_ids["input_ids"].shape[1]
-    candidate_logits = logits[:, prompt_len - 1:-1, :]
-    candidate_token_ids = candidate_ids["input_ids"]
-    token_log_probs = torch.log_softmax(candidate_logits, dim=-1)
-    gathered = token_log_probs.gather(dim=-1, index=candidate_token_ids.unsqueeze(-1)).squeeze(-1)
-    return gathered.sum().item()
+    results = []
+    for i, (prompt_ids, cand_ids) in enumerate(zip(prompt_id_list, candidate_id_list)):
+        pad_len = max_len - (prompt_ids.shape[0] + cand_ids.shape[0])
+        # position of first candidate token in padded sequence
+        cand_start = pad_len + prompt_ids.shape[0] - 1
+        cand_end = cand_start + cand_ids.shape[0]
+        cand_logits = logits[i, cand_start:cand_end, :]
+        log_probs = torch.log_softmax(cand_logits, dim=-1)
+        gathered = log_probs.gather(dim=-1, index=cand_ids.to(device).unsqueeze(-1)).squeeze(-1)
+        results.append(gathered.sum().item())
+    return results
 
 
-def score_candidates(
-    model: Any,
-    tokenizer: Any,
-    prompt: str,
-    candidates: list[str],
-) -> tuple[str, dict[str, float]]:
-    scores = {candidate: candidate_logprob(model, tokenizer, prompt, candidate) for candidate in candidates}
-    ordered = sorted(scores.items(), key=lambda item: item[1], reverse=True)
-    raw_scores = torch.tensor([item[1] for item in ordered], dtype=torch.float32)
-    probabilities = torch.softmax(raw_scores, dim=0)
-    probability_map = {
-        ordered[index][0]: float(probabilities[index].item())
-        for index in range(len(ordered))
-    }
-    return ordered[0][0], probability_map
-
-
-def evaluate_example(model: Any, tokenizer: Any, example: TaskExample) -> dict[str, Any]:
-    if example.answer_kind == "classification":
-        prediction, candidate_probabilities = score_candidates(
-            model=model,
-            tokenizer=tokenizer,
-            prompt=example.prompt,
-            candidates=example.candidates,
+def evaluate_classification_batch(model: Any, tokenizer: Any, examples: list[TaskExample]) -> list[dict[str, Any]]:
+    rendered_prompts = [
+        render_chat_text(tokenizer, build_prompt_messages(ex.prompt), add_generation_prompt=True)
+        for ex in examples
+    ]
+    # Score each candidate across all examples: one batched forward pass per candidate.
+    candidates = examples[0].candidates
+    scores_per_candidate: dict[str, list[float]] = {}
+    for candidate in candidates:
+        scores_per_candidate[candidate] = batch_candidate_logprob(
+            model, tokenizer, rendered_prompts, [candidate] * len(examples)
         )
-        is_correct = prediction == example.gold_answer
-        return {
-            "id": example.sample_id,
-            "task": example.task,
-            "answer_kind": example.answer_kind,
-            "prompt": example.prompt,
-            "gold_answer": example.gold_answer,
-            "prediction": prediction,
-            "is_correct": is_correct,
-            "candidate_probabilities": candidate_probabilities,
-            "metadata": example.metadata,
-        }
 
-    prediction = generate_answer(
-        model=model,
-        tokenizer=tokenizer,
-        prompt=example.prompt,
-        max_new_tokens=example.max_new_tokens,
-    )
-    is_correct = is_open_answer_correct(prediction, example.gold_answer)
-    return {
-        "id": example.sample_id,
-        "task": example.task,
-        "answer_kind": example.answer_kind,
-        "prompt": example.prompt,
-        "gold_answer": example.gold_answer,
-        "prediction": prediction,
-        "is_correct": is_correct,
-        "metadata": example.metadata,
-    }
+    results = []
+    for i, ex in enumerate(examples):
+        scores = {c: scores_per_candidate[c][i] for c in candidates}
+        ordered = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+        raw_scores = torch.tensor([item[1] for item in ordered], dtype=torch.float32)
+        probabilities = torch.softmax(raw_scores, dim=0)
+        probability_map = {ordered[j][0]: float(probabilities[j].item()) for j in range(len(ordered))}
+        prediction = ordered[0][0]
+        is_correct = prediction == ex.gold_answer
+        results.append({
+            "id": ex.sample_id,
+            "task": ex.task,
+            "answer_kind": ex.answer_kind,
+            "prompt": ex.prompt,
+            "gold_answer": ex.gold_answer,
+            "prediction": prediction,
+            "is_correct_strict": is_correct,
+            "is_correct_rtuning": is_correct,
+            "is_refusal": False,
+            "followup_response": None,
+            "candidate_probabilities": probability_map,
+            "metadata": ex.metadata,
+        })
+    return results
+
+
+def evaluate_open_batch(model: Any, tokenizer: Any, examples: list[TaskExample]) -> list[dict[str, Any]]:
+    max_new_tokens = max(ex.max_new_tokens for ex in examples)
+    answer_prompts = [
+        render_chat_text(tokenizer, build_prompt_messages(ex.prompt), add_generation_prompt=True)
+        for ex in examples
+    ]
+    predictions = batch_generate(model, tokenizer, answer_prompts, max_new_tokens)
+
+    followup_prompts = [
+        render_chat_text(
+            tokenizer,
+            [
+                {"role": "user", "content": ex.prompt},
+                {"role": "assistant", "content": pred},
+                {"role": "user", "content": FOLLOW_UP_QUESTION},
+            ],
+            add_generation_prompt=True,
+        )
+        for ex, pred in zip(examples, predictions)
+    ]
+    followup_responses = batch_generate(model, tokenizer, followup_prompts, max_new_tokens=16)
+
+    results = []
+    for ex, prediction, followup_response in zip(examples, predictions, followup_responses):
+        is_correct_strict = is_open_answer_correct(prediction, ex.gold_answer)
+        refused = is_refusal(followup_response)
+        results.append({
+            "id": ex.sample_id,
+            "task": ex.task,
+            "answer_kind": ex.answer_kind,
+            "prompt": ex.prompt,
+            "gold_answer": ex.gold_answer,
+            "prediction": prediction,
+            "is_correct_strict": is_correct_strict,
+            "is_correct_rtuning": is_correct_strict or refused,
+            "is_refusal": refused,
+            "followup_response": followup_response,
+            "metadata": ex.metadata,
+        })
+    return results
 
 
 def summarize_predictions(predictions: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, Any]:
@@ -229,15 +284,25 @@ def summarize_predictions(predictions: list[dict[str, Any]], args: argparse.Name
         by_task[prediction["task"]].append(prediction)
 
     task_metrics: dict[str, Any] = {}
-    total_correct = 0
+    total_correct_strict = 0
+    total_correct_rtuning = 0
+    total_refused = 0
     for task, items in sorted(by_task.items()):
-        correct = sum(1 for item in items if item["is_correct"])
+        correct_strict = sum(1 for item in items if item["is_correct_strict"])
+        correct_rtuning = sum(1 for item in items if item["is_correct_rtuning"])
+        refused = sum(1 for item in items if item["is_refusal"])
         total = len(items)
-        total_correct += correct
+        total_correct_strict += correct_strict
+        total_correct_rtuning += correct_rtuning
+        total_refused += refused
         task_metrics[task] = {
             "total": total,
-            "correct": correct,
-            "accuracy": correct / total if total else 0.0,
+            "correct_strict": correct_strict,
+            "correct_rtuning": correct_rtuning,
+            "refused": refused,
+            "accuracy_strict": correct_strict / total if total else 0.0,
+            "accuracy_rtuning": correct_rtuning / total if total else 0.0,
+            "refusal_rate": refused / total if total else 0.0,
         }
 
     total = len(predictions)
@@ -250,8 +315,12 @@ def summarize_predictions(predictions: list[dict[str, Any]], args: argparse.Name
         "tasks": args.tasks,
         "limit_per_task": args.limit_per_task,
         "total": total,
-        "correct": total_correct,
-        "accuracy": total_correct / total if total else 0.0,
+        "correct_strict": total_correct_strict,
+        "correct_rtuning": total_correct_rtuning,
+        "refused": total_refused,
+        "accuracy_strict": total_correct_strict / total if total else 0.0,
+        "accuracy_rtuning": total_correct_rtuning / total if total else 0.0,
+        "refusal_rate": total_refused / total if total else 0.0,
         "per_task": task_metrics,
     }
 
@@ -284,8 +353,33 @@ def main() -> None:
     )
 
     predictions: list[dict[str, Any]] = []
+    open_buffer: list[TaskExample] = []
+    classification_buffer: list[TaskExample] = []
+
+    def flush_open_buffer() -> None:
+        if open_buffer:
+            predictions.extend(evaluate_open_batch(model, tokenizer, open_buffer))
+            open_buffer.clear()
+
+    def flush_classification_buffer() -> None:
+        if classification_buffer:
+            predictions.extend(evaluate_classification_batch(model, tokenizer, classification_buffer))
+            classification_buffer.clear()
+
     for example in tqdm(examples, desc=f"Evaluating {args.split} split"):
-        predictions.append(evaluate_example(model=model, tokenizer=tokenizer, example=example))
+        if example.answer_kind == "classification":
+            flush_open_buffer()
+            classification_buffer.append(example)
+            if len(classification_buffer) >= args.batch_size:
+                flush_classification_buffer()
+        else:
+            flush_classification_buffer()
+            open_buffer.append(example)
+            if len(open_buffer) >= args.batch_size:
+                flush_open_buffer()
+
+    flush_open_buffer()
+    flush_classification_buffer()
 
     metrics = summarize_predictions(predictions, args)
     write_outputs(predictions, metrics, args.output_dir)
