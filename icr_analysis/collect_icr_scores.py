@@ -31,16 +31,16 @@ import torch
 # Resolve paths ---------------------------------------------------------------
 _HERE = Path(__file__).resolve().parent
 _PROJECT_ROOT = _HERE.parent          # qwen_rtuning/
-_REPO_ROOT = _PROJECT_ROOT.parent     # /Volumes/LMY/code/
+_REPO_ROOT = _PROJECT_ROOT.parent     # parent of qwen_rtuning (e.g. /root/autodl-tmp)
 
-# Use ICRScore from icr_probe_repro (has the efficient single-pass helpers)
-_ICR_SRC = _REPO_ROOT / "icr_probe_repro" / "src"
-if str(_ICR_SRC) not in sys.path:
-    sys.path.insert(0, str(_ICR_SRC))
-if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
+# qwen_rtuning package lives one level above the project root
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+# icr_analysis/ is on the path so we can import icr_score directly
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
 
-from icrprobe import ICRScore  # noqa: E402
+from icr_score import ICRScore  # noqa: E402  (vendored copy in icr_analysis/)
 from peft import PeftModel  # noqa: E402
 from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: E402
 
