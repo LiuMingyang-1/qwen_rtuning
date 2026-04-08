@@ -309,6 +309,7 @@ def plot_stacked(
         for sk in stack_keys:
             vals = np.array([
                 stats_by_task[task].get(cond, {}).get(sk, 0)
+                / max(stats_by_task[task].get(cond, {}).get("total", 1), 1)
                 for cond in CONDITIONS
             ])
             ax.bar(
@@ -413,6 +414,11 @@ def main() -> None:
 
     if len(common_ids) < 10:
         raise ValueError("Too few common sample IDs — check that both files share the same test set.")
+    coverage = len(common_ids) / max(len(base_all), len(rt_all))
+    if coverage < 0.9:
+        print(f"[WARN] Only {coverage:.1%} of samples are common to both files "
+              f"({len(common_ids)}/{max(len(base_all), len(rt_all))}). "
+              f"Results reflect this subset only.")
 
     # Derive labels for base (for stratified split)
     base_labels = [base_all[sid]["label"] for sid in common_ids]

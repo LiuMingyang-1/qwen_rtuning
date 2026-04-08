@@ -108,6 +108,8 @@ def compute_stats(records):
 def probe_cv(X, y, n_splits=5, seed=42):
     if len(X) == 0 or y.sum() == 0 or (y == 0).sum() == 0:
         return None
+    if min(int(y.sum()), int((y == 0).sum())) < n_splits:
+        return None
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
     clf = make_pipeline(
         StandardScaler(),
