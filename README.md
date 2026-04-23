@@ -244,6 +244,87 @@ python3 qwen_rtuning/eval.py \
   --bf16
 ```
 
+## 两个拒答基线（Qwen2.5-7B-Instruct 基座）
+
+新增脚本：
+
+- `qwen_rtuning/baseline_reject_eval.py`：在 GPU 机器上跑新基线逐样本结果
+- `qwen_rtuning/icr_analysis/compare_baselines.py`：本地统一切分、阈值选择和最终对比
+
+说明：`compare_baselines.py` 与现有 ICR 脚本口径一致，使用 `scikit-learn` 的 `StandardScaler + LogisticRegression`。
+
+### 1) uncertainty-threshold reject（云端 GPU）
+
+```bash
+python3 qwen_rtuning/baseline_reject_eval.py \
+  --model_name_or_path Qwen/Qwen2.5-7B-Instruct \
+  --data_root qwen_rtuning/R-Tuning-data \
+  --tasks pararel hotpotqa \
+  --prompt_domain ID \
+  --baseline uncertainty \
+  --output_dir outputs/eval/baselines/uncertainty \
+  --load_in_4bit \
+  --bf16
+```
+
+### 2) 4-sample consistency reject（云端 GPU）
+
+```bash
+python3 qwen_rtuning/baseline_reject_eval.py \
+  --model_name_or_path Qwen/Qwen2.5-7B-Instruct \
+  --data_root qwen_rtuning/R-Tuning-data \
+  --tasks pararel hotpotqa \
+  --prompt_domain ID \
+  --baseline consistency \
+  --num_samples 4 \
+  --temperature 0.7 \
+  --top_p 0.95 \
+  --output_dir outputs/eval/baselines/consistency \
+  --load_in_4bit \
+  --bf16
+```
+
+### 3) 20 samples/task smoke test（云端 GPU）
+
+```bash
+python3 qwen_rtuning/baseline_reject_eval.py \
+  --model_name_or_path Qwen/Qwen2.5-7B-Instruct \
+  --data_root qwen_rtuning/R-Tuning-data \
+  --tasks pararel hotpotqa \
+  --prompt_domain ID \
+  --baseline consistency \
+  --num_samples 4 \
+  --temperature 0.7 \
+  --top_p 0.95 \
+  --limit_per_task 20 \
+  --output_dir outputs/eval/baselines/consistency-smoke \
+  --load_in_4bit \
+  --bf16
+```
+
+### 4) 本地统一对比与阈值选择
+
+`compare_baselines.py` 会：
+
+- 在共有 ID 上生成固定 `seed=42`、`val_ratio=0.3` 的共享切分
+- 在 val 上为 uncertainty / consistency 选阈值
+- 在 test 上输出 `base / r-tuning_only / icr_only / icr+r-tuning(OR) / uncertainty / consistency` 指标
+
+默认不允许 probe 训练使用 test 子集；仅 smoke/debug 时可额外加
+`--allow_probe_train_on_all_common_for_debug`。
+
+```bash
+python3 qwen_rtuning/icr_analysis/compare_baselines.py \
+  --base_predictions_path outputs/eval/unsure-id-base/predictions.jsonl \
+  --rtuning_predictions_path outputs/eval/unsure-id-rtuning/predictions.jsonl \
+  --icr_base_path qwen_rtuning/icr_analysis/outputs/outputs/icr_scores_base.jsonl \
+  --icr_rtuning_path qwen_rtuning/icr_analysis/outputs/outputs/icr_scores_rtuning.jsonl \
+  --uncertainty_predictions_path outputs/eval/baselines/uncertainty/predictions.jsonl \
+  --consistency_predictions_path outputs/eval/baselines/consistency/predictions.jsonl \
+  --tasks pararel hotpotqa \
+  --output_dir outputs/eval/baselines/comparison
+```
+
 ## 建议的实际执行顺序
 
 上服务器以后先别直接全量跑，建议按这个顺序：
