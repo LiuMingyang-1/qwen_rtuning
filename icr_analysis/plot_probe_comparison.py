@@ -31,8 +31,9 @@ for ax, (task_key, task_title) in zip(axes, tasks):
         errs   = []
         for ds in datasets:
             key = f"{model}/{task_key}/{ds}"
-            aurocs.append(results[key]["auroc_mean"])
-            errs.append(results[key]["auroc_std"])
+            entry = results.get(key, {})
+            aurocs.append(entry.get("auroc_mean", float("nan")))
+            errs.append(entry.get("auroc_std", 0.0))
         offset = (i - 0.5) * width
         bars = ax.bar(x + offset, aurocs, width, yerr=errs, capsize=4,
                       label=labels[model], color=colors[model], alpha=0.85)

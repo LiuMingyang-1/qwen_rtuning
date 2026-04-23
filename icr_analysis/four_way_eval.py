@@ -138,19 +138,23 @@ def compute_stats(labels: List[str]) -> Dict[str, float]:
 def build_probe_dataset(
     records: Dict[str, dict],
     ids: List[str],
-    pos_label: str = "hallucination",
-    neg_label: str = "correct_confident",
+    pos_labels: List[str],
+    neg_labels: List[str],
 ) -> Tuple[np.ndarray, np.ndarray, List[str]]:
-    """Extract (X, y, ids) for probe training."""
+    """Extract (X, y, ids) for probe training.
+
+    pos_labels: labels assigned y=1 (probe should fire / refuse)
+    neg_labels: labels assigned y=0 (probe should not fire)
+    """
     X, y, used_ids = [], [], []
     for sid in ids:
         rec = records.get(sid)
         if rec is None:
             continue
         label = rec.get("label")
-        if label == pos_label:
+        if label in pos_labels:
             y.append(1)
-        elif label == neg_label:
+        elif label in neg_labels:
             y.append(0)
         else:
             continue
@@ -188,7 +192,8 @@ def train_probe(X: np.ndarray, y: np.ndarray, use_mlp: bool = False, seed: int =
 def evaluate_four_way(
     base_records: Dict[str, dict],
     rt_records: Dict[str, dict],
-    probe,
+    probe_base,
+    probe_rt,
     test_ids: List[str],
     threshold: float = 0.5,
 ) -> Dict[str, Dict[str, float]]:
@@ -197,8 +202,12 @@ def evaluate_four_way(
 
     base        – base is_correct, no refusal
     refuse_only – rtuning is_correct + rtuning is_refusal
-    icr_only    – base is_correct + probe(base ICR)
-    icr_refuse  – rtuning is_correct + probe(rtuning ICR)
+    icr_only    – base is_correct + probe_base(base ICR)
+    icr_refuse  – rtuning is_correct + (rtuning refusal OR probe_rt(rtuning ICR))
+
+    Each probe is trained on its own model's ICR scores so the feature
+    distributions match.  icr_refuse uses OR so the probe can only add
+    refusals on top of rtuning's existing refusal behaviour.
     """
     results: Dict[str, List[str]] = {c: [] for c in CONDITIONS}
 
@@ -215,13 +224,16 @@ def evaluate_four_way(
         base_vec = icr_vector(base_rec["icr_scores"]).reshape(1, -1)
         rt_vec   = icr_vector(rt_rec["icr_scores"]).reshape(1, -1)
 
-        probe_base = probe.predict_proba(base_vec)[0, 1] >= threshold
-        probe_rt   = probe.predict_proba(rt_vec)[0, 1] >= threshold
+        probe_base_flag = probe_base.predict_proba(base_vec)[0, 1] >= threshold
+        probe_rt_flag   = probe_rt.predict_proba(rt_vec)[0, 1] >= threshold
+
+        # icr_refuse: refuse if rtuning already refuses OR probe fires
+        combined_refusal = rt_refusal or bool(probe_rt_flag)
 
         results["base"].append(derive_label(base_correct, False))
         results["refuse_only"].append(derive_label(rt_correct, rt_refusal))
-        results["icr_only"].append(derive_label(base_correct, bool(probe_base)))
-        results["icr_refuse"].append(derive_label(rt_correct, bool(probe_rt)))
+        results["icr_only"].append(derive_label(base_correct, bool(probe_base_flag)))
+        results["icr_refuse"].append(derive_label(rt_correct, combined_refusal))
 
     return {cond: compute_stats(labels) for cond, labels in results.items()}
 
@@ -432,26 +444,43 @@ def main() -> None:
     )
     print(f"Train: {len(train_ids)}  |  Test: {len(test_ids)}")
 
-    # Build probe training data from base model train split
-    X_train, y_train, probe_train_ids = build_probe_dataset(
-        base_all, train_ids,
-        pos_label="hallucination",
-        neg_label="correct_confident",
-    )
-    print(f"Probe train set: {len(X_train)} samples "
-          f"(hallucination={y_train.sum()}, correct_confident={(y_train==0).sum()})")
-
-    if len(X_train) < 10:
-        raise ValueError("Too few probe training samples — check labels in icr_scores_base.jsonl.")
-
-    # Probe AUROC (CV on train set)
-    auroc_cv = probe_auroc_cv(X_train, y_train, use_mlp=args.use_mlp, seed=args.seed)
     probe_type = "MLP" if args.use_mlp else "LR"
-    print(f"Probe ({probe_type}) 5-fold CV AUROC on train set: "
-          f"{auroc_cv:.3f}" if auroc_cv else "N/A")
 
-    # Train final probe on all train data
-    probe = train_probe(X_train, y_train, use_mlp=args.use_mlp, seed=args.seed)
+    # ---- Probe for base model (icr_only) ------------------------------------
+    # Base model only has hallucination / correct_confident labels.
+    X_base, y_base, _ = build_probe_dataset(
+        base_all, train_ids,
+        pos_labels=["hallucination"],
+        neg_labels=["correct_confident"],
+    )
+    print(f"Base probe train set: {len(X_base)} samples "
+          f"(pos={y_base.sum()}, neg={(y_base==0).sum()})")
+    if len(X_base) < 10:
+        raise ValueError("Too few base probe training samples.")
+
+    auroc_base = probe_auroc_cv(X_base, y_base, use_mlp=args.use_mlp, seed=args.seed)
+    print(f"Base probe ({probe_type}) 5-fold CV AUROC: "
+          f"{auroc_base:.3f}" if auroc_base else "N/A")
+    probe_base = train_probe(X_base, y_base, use_mlp=args.use_mlp, seed=args.seed)
+
+    # ---- Probe for R-Tuning model (icr_refuse) ------------------------------
+    # Trained on ALL rtuning samples: positive = answer wrong (hallucination +
+    # correct_refusal), negative = answer right (correct_confident + false_refusal).
+    # Combined with rtuning's own refusal via OR at eval time.
+    X_rt, y_rt, _ = build_probe_dataset(
+        rt_all, train_ids,
+        pos_labels=["hallucination", "correct_refusal"],
+        neg_labels=["correct_confident", "false_refusal"],
+    )
+    print(f"RTuning probe train set: {len(X_rt)} samples "
+          f"(pos={y_rt.sum()}, neg={(y_rt==0).sum()})")
+    if len(X_rt) < 10:
+        raise ValueError("Too few rtuning probe training samples.")
+
+    auroc_rt = probe_auroc_cv(X_rt, y_rt, use_mlp=args.use_mlp, seed=args.seed)
+    print(f"RTuning probe ({probe_type}) 5-fold CV AUROC: "
+          f"{auroc_rt:.3f}" if auroc_rt else "N/A")
+    probe_rt = train_probe(X_rt, y_rt, use_mlp=args.use_mlp, seed=args.seed)
 
     # ---- Evaluate per task -----------------------------------------------
     tasks = get_tasks(base_path)
@@ -473,8 +502,8 @@ def main() -> None:
         if not task_test_ids:
             continue
 
-        stats = evaluate_four_way(base_all, rt_all, probe, task_test_ids,
-                                   threshold=args.probe_threshold)
+        stats = evaluate_four_way(base_all, rt_all, probe_base, probe_rt,
+                                  task_test_ids, threshold=args.probe_threshold)
         stats_by_task[task] = stats
 
         task_label = task or "all"

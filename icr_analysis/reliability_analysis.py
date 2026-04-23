@@ -246,6 +246,23 @@ def main():
     plot_probe(probe_base, probe_rt, tasks,
                out_dir / "reliability_probe.png")
 
+    # Save numerical results to JSON
+    results = {
+        "stats": {
+            "base":    {(t or "all"): stats_base[t or "all"] for t in tasks},
+            "rtuning": {(t or "all"): stats_rt[t or "all"]   for t in tasks},
+        },
+        "probe_auroc": {
+            "base":    {(t or "all"): {"auroc_mean": probe_base[t or "all"][0],
+                                       "auroc_std":  probe_base[t or "all"][1]} for t in tasks},
+            "rtuning": {(t or "all"): {"auroc_mean": probe_rt[t or "all"][0],
+                                       "auroc_std":  probe_rt[t or "all"][1]}   for t in tasks},
+        },
+    }
+    json_path = out_dir.parent / "reliability_results.json"
+    json_path.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"Results saved: {json_path}")
+
 
 if __name__ == "__main__":
     main()
